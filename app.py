@@ -6,6 +6,7 @@
 #
 # Load via file uploader (recommended) or by typing a local/server path.
 # Filters and explores all assets; asset type filter driven by SUBCAT column.
+# Email composer (only for users with ≥2 assets) with .EML download for Outlook.
 # -----------------------------
 import io
 import os
@@ -16,10 +17,80 @@ import streamlit as st
 import datetime as dt
 import altair as alt
 from pathlib import Path
-import urllib.parse  # for mailto links
+import urllib.parse  # for mailto links & web deeplinks
+
+# For building .eml (HTML email) files
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+import html as _html
 
 # Page setup
 st.set_page_config(page_title="Asset Dashboard", layout="wide")
+
+# ===== Global styles for a cleaner look =====
+st.markdown("""
+<style>
+/* Tighter base spacing */
+.block-container { padding-top: 1.2rem; padding-bottom: 2rem; }
+
+/* Subtle section divider */
+.hr { border: 0; border-top: 1px solid rgba(180,180,180,.25); margin: 0.75rem 0 1rem 0; }
+
+/* Sticky table headers in dataframes */
+[data-testid="stDataFrame"] thead tr { position: sticky; top: 0; z-index: 1; }
+
+/* Make expanders less chunky */
+.stExpander { border: 1px solid rgba(150,150,150,.25); border-radius: 8px; }
+.stExpander > div > div { padding-top: .25rem; }
+
+/* Primary action cluster */
+.action-bar {
+  display: flex; gap: .5rem; align-items: center; flex-wrap: wrap; margin: .25rem 0 .75rem 0;
+}
+
+/* "Card" look for sections */
+.card {
+  border: 1px solid rgba(150,150,150,.25);
+  border-radius: 10px;
+  padding: .75rem .9rem;
+  background: rgba(120,120,120,.05);
+  margin-bottom: .75rem;
+}
+
+/* Smaller table row height */
+[data-testid="stDataFrame"] tbody tr td { padding-top: 6px; padding-bottom: 6px; }
+
+/* Subheaders with subtle rule */
+h4, h5 { margin-bottom: .3rem; }
+.section-caption { color: #888; font-size: .9rem; margin-top: -.35rem; }
+
+/* Header row layout (logo + title) */
+.app-topbar {
+  display: flex; align-items: center; gap: 12px; margin: 4px 0 12px 0;
+}
+.app-logo { height: 44px; width: auto; object-fit: contain; transform: translateY(2px); }
+.app-title { margin: 0; line-height: 1.1; font-weight: 700; }
+@media (min-width: 900px)  { .app-title { font-size: 2.0rem; } }
+@media (min-width: 1200px) { .app-title { font-size: 2.2rem; } }
+</style>
+""", unsafe_allow_html=True)
+
+# ===== Simple UI helpers =====
+def section_header(title: str, caption: str | None = None):
+    st.markdown(f"### {title}")
+    if caption:
+        st.markdown(f'<div class="section-caption">{caption}</div>', unsafe_allow_html=True)
+    st.markdown('<hr class="hr">', unsafe_allow_html=True)
+
+def card():
+    """Context manager card container: with card(): ..."""
+    from contextlib import contextmanager
+    @contextmanager
+    def _card():
+        st.markdown('<div class="card">', unsafe_allow_html=True)
+        yield
+        st.markdown('</div>', unsafe_allow_html=True)
+    return _card()
 
 # --- Clean, perfectly aligned logo + title header ---
 def resolve_logo(filename: str) -> Path | None:
@@ -60,40 +131,7 @@ if logo_path:
     if b64:
         logo_src = f"data:image/png;base64,{b64}"
 
-# Styles to align logo and title
-st.markdown("""
-<style>
-/* Make the header a single-row flex container */
-.app-topbar {
-  display: flex;
-  align-items: center;               /* vertical centering */
-  gap: 12px;                         /* space between logo and title */
-  margin: 4px 0 12px 0;              /* compact spacing */
-}
-
-/* Control the logo size and optical alignment */
-.app-logo {
-  height: 44px;                      /* adjust to taste: 36–48px works well */
-  width: auto;
-  flex: 0 0 auto;
-  object-fit: contain;
-  transform: translateY(2px);        /* tiny nudge to align with text baseline */
-}
-
-/* Title reset so it doesn't push down */
-.app-title {
-  margin: 0;
-  line-height: 1.1;
-  font-weight: 700;
-}
-
-/* Optional: responsive scaling of the title on larger screens */
-@media (min-width: 900px)  { .app-title { font-size: 2.0rem; } }
-@media (min-width: 1200px) { .app-title { font-size: 2.2rem; } }
-</style>
-""", unsafe_allow_html=True)
-
-# Render single flex row with <img> + <h1>
+# Render header row
 if logo_src:
     st.markdown(
         f"""
@@ -124,7 +162,7 @@ AGE_CANDIDATES = ["AGE", "ASSET_AGE_YEARS"]
 PURCHASE_DATE_CANDIDATES = ["PURCHASE_DATE", "BUY_DATE", "PO_DATE", "INVOICE_DATE", "PROCUREMENT_DATE"]
 ASSET_ID_CANDIDATES = ["ASSETNO", "ASSET_NO", "ASSET_NUMBER", "ASSET_ID"]
 SERIAL_ID_CANDIDATES = ["SRNO", "SERIAL", "SERIAL_NO", "SERIALNUMBER"]
-EMAIL_CANDIDATES = ["EMAIL", "MAIL", "USER_EMAIL", "WORK_EMAIL", "E_MAIL"]  # NEW
+EMAIL_CANDIDATES = ["EMAIL", "MAIL", "USER_EMAIL", "WORK_EMAIL", "E_MAIL"]
 
 # Preferred Results table order (includes EMPNAME & EMPID)
 PREFERRED_DISPLAY_COLUMNS = [
@@ -192,7 +230,7 @@ def load_data(path_or_buffer, sheet):
     purchase_col = guess_column(df, PURCHASE_DATE_CANDIDATES)
     asset_id_col = guess_column(df, ASSET_ID_CANDIDATES)
     serial_id_col = guess_column(df, SERIAL_ID_CANDIDATES)
-    email_col = guess_column(df, EMAIL_CANDIDATES)  # NEW
+    email_col = guess_column(df, EMAIL_CANDIDATES)
 
     # Fallback for user_col to EMPNAME/EMPID if no user-like column detected
     if user_col is None:
@@ -229,7 +267,7 @@ def load_data(path_or_buffer, sheet):
         "purchase_col": purchase_col,
         "asset_id_col": asset_id_col,
         "serial_id_col": serial_id_col,
-        "email_col": email_col,  # NEW
+        "email_col": email_col,
     }
 
 # ---------- Filter utilities ----------
@@ -289,46 +327,85 @@ def read_excel_sheets(file_like_or_path) -> list[str]:
     xls = pd.ExcelFile(file_like_or_path, engine="openpyxl")
     return xls.sheet_names
 
-# ---------- Email helpers (NEW) ----------
+# ---------- Email helpers ----------
 def _first_non_null(series: pd.Series) -> str | None:
     if series is None:
         return None
     vals = pd.Series(series).dropna().astype(str).str.strip()
     return vals.iloc[0] if not vals.empty else None
 
-def make_assets_text_table(df_user: pd.DataFrame, columns: list[str]) -> str:
+def make_box_table(df_user: pd.DataFrame, columns: list[str], max_width: int = 30) -> str:
     """
-    Render a compact plain-text table for email body.
-    (Plain text is more reliable than HTML in mailto: bodies and easy to paste into Outlook.)
+    Render a box-drawing table that looks solid in Outlook even with proportional fonts.
     """
     cols = [c for c in columns if c in df_user.columns]
     if not cols:
         return "(no details available)"
 
-    # Build rows (as strings)
-    rows = [[("" if pd.isna(v) else str(v)) for v in r] for r in df_user[cols].itertuples(index=False, name=None)]
+    rows = [[("" if pd.isna(v) else str(v)) for v in r]
+            for r in df_user[cols].itertuples(index=False, name=None)]
 
-    # Compute widths, cap for readability
-    max_width = 30
-    col_widths = []
-    for idx, c in enumerate(cols):
-        content_lengths = [len(r[idx]) for r in rows] if rows else [0]
-        w = min(max([len(c)] + content_lengths), max_width)
-        col_widths.append(w)
+    # Compute per-column widths (cap for readability)
+    widths = []
+    for i, c in enumerate(cols):
+        content_lens = [len(r[i]) for r in rows] if rows else [0]
+        w = min(max([len(c)] + content_lens), max_width)
+        widths.append(w)
 
-    def fmt_row(values):
-        trunc = [(v if len(v) <= w else (v[: w - 1] + "…")) for v, w in zip(values, col_widths)]
-        return " | ".join(v.ljust(w) for v, w in zip(trunc, col_widths))
+    def trunc(v, w):
+        return v if len(v) <= w else (v[:w-1] + "…")
 
-    header = fmt_row(cols)
-    sep = "-+-".join("-" * w for w in col_widths)
-    body = "\n".join(fmt_row(r) for r in rows)
-    return f"{header}\n{sep}\n{body}"
+    def pad(v, w):
+        return v + (" " * (w - len(v)))
+
+    # Lines
+    top = "┌" + "┬".join("─" * w for w in widths) + "┐"
+    sep = "├" + "┼".join("─" * w for w in widths) + "┤"
+    bot = "└" + "┴".join("─" * w for w in widths) + "┘"
+
+    header_cells = [pad(trunc(c, w), w) for c, w in zip(cols, widths)]
+    header = "│" + "│".join(header_cells) + "│"
+
+    body_lines = []
+    for r in rows:
+        cells = [pad(trunc(v, w), w) for v, w in zip(r, widths)]
+        body_lines.append("│" + "│".join(cells) + "│")
+
+    return "\n".join([top, header, sep] + body_lines + [bot])
+
+def make_html_table(df_user: pd.DataFrame, columns: list[str]) -> str:
+    """Build an HTML table with light borders, Outlook-friendly styles."""
+    cols = [c for c in columns if c in df_user.columns]
+    if not cols:
+        return "<p>(no details available)</p>"
+
+    def esc(x): 
+        return _html.escape("" if pd.isna(x) else str(x))
+
+    thead = "<tr>" + "".join(
+        f"<th style='text-align:left;padding:6px 8px;border:1px solid #ccc;background:#f7f7f7'>{esc(c)}</th>"
+        for c in cols
+    ) + "</tr>"
+
+    rows_html = []
+    for _, r in df_user[cols].iterrows():
+        tds = "".join(
+            f"<td style='text-align:left;padding:6px 8px;border:1px solid #ccc'>{esc(r[c])}</td>"
+            for c in cols
+        )
+        rows_html.append(f"<tr>{tds}</tr>")
+    tbody = "\n".join(rows_html)
+
+    table = f"""
+    <table style="border-collapse:collapse;border:1px solid #ccc;font-family:Segoe UI,Arial,sans-serif;font-size:12.5px">
+      <thead>{thead}</thead>
+      <tbody>{tbody}</tbody>
+    </table>
+    """
+    return table
 
 def build_mailto_link(to_addr: str | None, subject: str, body: str) -> str:
-    """
-    Create a mailto: URL. Uses CRLF for line breaks as many clients prefer it.
-    """
+    """Create a mailto: URL (plain text only)."""
     if to_addr is None:
         to_addr = ""
     body = body.replace("\r\n", "\n").replace("\n", "\r\n")
@@ -339,6 +416,33 @@ def build_mailto_link(to_addr: str | None, subject: str, body: str) -> str:
         params.append("body=" + urllib.parse.quote(body, safe=""))
     query = "&".join(params)
     return f"mailto:{to_addr}?{query}" if query else f"mailto:{to_addr}"
+
+def build_outlook_web_compose(to_addr: str | None, subject: str, body_text: str) -> str:
+    """Compose in Outlook on the Web (body is typically plain text)."""
+    base = "https://outlook.office.com/mail/deeplink/compose"
+    params = {
+        "to": to_addr or "",
+        "subject": subject,
+        "body": body_text,
+    }
+    return base + "?" + urllib.parse.urlencode(params, quote_via=urllib.parse.quote)
+
+def build_eml(to_addr: str | None, subject: str, html_body: str, text_fallback: str = "") -> bytes:
+    """
+    Build an .eml message (MIME) with HTML + plain text alternative.
+    Outlook opens .eml and allows editing/sending.
+    """
+    msg = MIMEMultipart("alternative")
+    if to_addr:
+        msg["To"] = to_addr
+    msg["Subject"] = subject
+    if not text_fallback:
+        text_fallback = "Please view this email in an HTML-capable client."
+    part_text = MIMEText(text_fallback, "plain", "utf-8")
+    part_html = MIMEText(html_body, "html", "utf-8")
+    msg.attach(part_text)
+    msg.attach(part_html)
+    return msg.as_bytes()
 
 # ---------- Sidebar: Source & Load ----------
 st.sidebar.header("📄 Data Source")
@@ -354,6 +458,10 @@ uploaded = st.sidebar.file_uploader(
 excel_path = st.sidebar.text_input("Or provide Excel file path", value=DEFAULT_EXCEL_PATH)
 
 # Detect available sheets
+def read_excel_sheets(file_like_or_path) -> list[str]:
+    xls = pd.ExcelFile(file_like_or_path, engine="openpyxl")
+    return xls.sheet_names
+
 source = uploaded if uploaded is not None else excel_path
 sheet_names = []
 try:
@@ -382,7 +490,7 @@ try:
     purchase_col = data["purchase_col"]
     asset_id_col = data["asset_id_col"]
     serial_id_col = data["serial_id_col"]
-    email_col = data["email_col"]  # NEW
+    email_col = data["email_col"]
 except Exception as e:
     st.sidebar.error(f"Failed to load Excel: {e}")
     st.stop()
@@ -396,7 +504,7 @@ with st.sidebar.expander("Detected columns (auto)", expanded=False):
         "Purchase date column": purchase_col,
         "Asset ID column": asset_id_col,
         "Serial ID column": serial_id_col,
-        "Email column": email_col,  # NEW
+        "Email column": email_col,
     })
 
 # ---------- Column mapping overrides (best UX) ----------
@@ -415,7 +523,7 @@ with st.sidebar.expander("🔧 Column mapping (override auto-detect)", expanded=
         index=0,
         help="Pick the unique device identifier. Common: ASSETNO or SRNO or SERIAL."
     )
-    email_override = st.selectbox(  # NEW
+    email_override = st.selectbox(
         "Email column (optional)",
         options=["(auto)"] + colnames,
         index=0,
@@ -466,10 +574,15 @@ tab_table, tab_charts, tab_summary = st.tabs(["📋 Table", "📊 Charts", "ℹ�
 st.sidebar.header("🎛️ Filters & Actions")
 
 # 🔝 Asset type filter (SUBCAT) first
+def options_for(df: pd.DataFrame, col: str) -> list[str]:
+    if col not in df.columns:
+        return []
+    vals = df[col].dropna().astype(str).str.strip().unique().tolist()
+    return sorted([v for v in vals if v != ""])
+
 subcat_options = options_for(df, "SUBCAT")
 subcat_sel = st.sidebar.multiselect("SUBCAT (Asset type)", subcat_options, help="Select one or more asset types.")
 
-# NEW: add grouped view into the action list
 action = st.sidebar.radio(
     "Choose action",
     ["All assets", "All users → all assets (grouped)", "Users with multiple assets", "Assets aged ≥ N years"],
@@ -478,21 +591,22 @@ action = st.sidebar.radio(
 
 with st.sidebar.expander("Attribute filters", expanded=False):
     # Build staged slices to keep options relevant
-    df_after_subcat = apply_list_filter(df, "SUBCAT", subcat_sel) if subcat_sel else df
+    df_after_subcat = df[df["SUBCAT"].isin(subcat_sel)] if ("SUBCAT" in df.columns and subcat_sel) else df
 
-    itemtype_sel = st.multiselect("ITEMTYPE", options_for(df_after_subcat, "ITEMTYPE"))
-    df_after_itemtype = apply_list_filter(df_after_subcat, "ITEMTYPE", itemtype_sel) if itemtype_sel else df_after_subcat
+    def mf(col): return st.multiselect(col, options_for(df_after_subcat, col)) if col in df_after_subcat.columns else []
+    itemtype_sel = mf("ITEMTYPE")
+    after_itemtype = df_after_subcat[df_after_subcat["ITEMTYPE"].isin(itemtype_sel)] if itemtype_sel else df_after_subcat
 
-    country_sel = st.multiselect("COUNTRY", options_for(df_after_itemtype, "COUNTRY"))
-    df_after_country = apply_list_filter(df_after_itemtype, "COUNTRY", country_sel) if country_sel else df_after_itemtype
+    country_sel = st.multiselect("COUNTRY", options_for(after_itemtype, "COUNTRY"))
+    after_country = after_itemtype[after_itemtype["COUNTRY"].isin(country_sel)] if country_sel else after_itemtype
 
-    city_sel    = st.multiselect("CITY",    options_for(df_after_country, "CITY"))
-    make_sel    = st.multiselect("MAKE",    options_for(df_after_country, "MAKE"))
-    model_sel   = st.multiselect("MODEL",   options_for(df_after_country, "MODEL"))
-    subloc_sel  = st.multiselect("SUBLOC (Building)", options_for(df_after_country, "SUBLOC"))
-    level_sel   = st.multiselect("LEVEL",   options_for(df_after_country, "LEVEL"))
-    locname_sel = st.multiselect("LOCNAME (Office)",  options_for(df_after_country, "LOCNAME"))
-    seatno_sel  = st.multiselect("SEATNO",  options_for(df_after_country, "SEATNO"))
+    city_sel    = st.multiselect("CITY",    options_for(after_country, "CITY"))
+    make_sel    = st.multiselect("MAKE",    options_for(after_country, "MAKE"))
+    model_sel   = st.multiselect("MODEL",   options_for(after_country, "MODEL"))
+    subloc_sel  = st.multiselect("SUBLOC (Building)", options_for(after_country, "SUBLOC"))
+    level_sel   = st.multiselect("LEVEL",   options_for(after_country, "LEVEL"))
+    locname_sel = st.multiselect("LOCNAME (Office)",  options_for(after_country, "LOCNAME"))
+    seatno_sel  = st.multiselect("SEATNO",  options_for(after_country, "SEATNO"))
 
 # Build safer defaults for search
 LIKELY_SEARCH_COLS = [
@@ -516,17 +630,36 @@ query = st.sidebar.text_input("Keyword search", placeholder="Type a keyword (e.g
 ascending = st.sidebar.checkbox("Ascending", value=True)
 
 # ---------- Apply filters & search ----------
-filtered = df
-filtered = apply_list_filter(filtered, "SUBCAT",   subcat_sel)
-filtered = apply_list_filter(filtered, "ITEMTYPE", itemtype_sel)
-filtered = apply_list_filter(filtered, "COUNTRY",  country_sel)
-filtered = apply_list_filter(filtered, "CITY",     city_sel)
-filtered = apply_list_filter(filtered, "MAKE",     make_sel)
-filtered = apply_list_filter(filtered, "MODEL",    model_sel)
-filtered = apply_list_filter(filtered, "SUBLOC",   subloc_sel)
-filtered = apply_list_filter(filtered, "LEVEL",    level_sel)
-filtered = apply_list_filter(filtered, "LOCNAME",  locname_sel)
-filtered = apply_list_filter(filtered, "SEATNO",   seatno_sel)
+filtered = df.copy()
+if subcat_sel and "SUBCAT" in filtered.columns:
+    filtered = filtered[filtered["SUBCAT"].isin(subcat_sel)]
+for col, vals in [
+    ("ITEMTYPE", itemtype_sel),
+    ("COUNTRY", country_sel),
+    ("CITY", city_sel),
+    ("MAKE", make_sel),
+    ("MODEL", model_sel),
+    ("SUBLOC", subloc_sel),
+    ("LEVEL", level_sel),
+    ("LOCNAME", locname_sel),
+    ("SEATNO", seatno_sel),
+]:
+    if vals and col in filtered.columns:
+        filtered = filtered[filtered[col].isin(vals)]
+
+def keyword_search(df_in: pd.DataFrame, query: str, cols: list[str]) -> pd.DataFrame:
+    if not query or not str(query).strip():
+        return df_in
+    q = str(query).strip()
+    cols_to_search = [c for c in cols if c in df_in.columns] or list(df_in.columns)
+    mask = None
+    for c in cols_to_search:
+        series = df_in[c]
+        if not (pd.api.types.is_string_dtype(series) or pd.api.types.is_object_dtype(series)):
+            series = series.astype(str)
+        col_mask = series.str.contains(q, case=False, na=False)
+        mask = col_mask if mask is None else (mask | col_mask)
+    return df_in[mask] if mask is not None else df_in
 
 filtered = keyword_search(filtered, query, search_cols)
 
@@ -535,12 +668,16 @@ st.caption(f"Filtered rows (ALL assets): {len(filtered):,} / {len(df):,}")
 # ---------- Main actions ----------
 if action == "All assets":
     with tab_table:
-        st.subheader("All Assets (after filters & search)")
+        section_header("All Assets (after filters & search)")
     result = filtered
 
 elif action == "All users → all assets (grouped)":
     with tab_table:
-        st.subheader("All users → all assets (grouped, only users with ≥2 assets)")
+        section_header(
+            "All users → all assets (grouped)",
+            "Only users with ≥2 assets are shown below. Use filters in the sidebar to narrow scope."
+        )
+
         # Validate required columns
         if not user_col or user_col not in filtered.columns:
             st.warning("User column not detected. Use the 'Column mapping' override to select EMPNAME/USER/etc.")
@@ -556,94 +693,133 @@ elif action == "All users → all assets (grouped)":
                 .reset_index(name="ASSET_COUNT")
                 .sort_values(["ASSET_COUNT", user_col], ascending=[False, True])
             )
-
-            # ONLY users with multiple assets (≥2)
             view_summary = summary.query("ASSET_COUNT >= 2").copy()
 
-            st.write("Summary (user → asset count)")
-            st.dataframe(view_summary, use_container_width=True, height=300)
+            # Summary card
+            with card():
+                c1, c2, c3 = st.columns([1,1,2])
+                with c1:
+                    st.metric("Users (≥2 assets)", f"{len(view_summary):,}")
+                with c2:
+                    st.metric("Rows in scope", f"{int(filtered[filtered[user_col].isin(view_summary[user_col])].shape[0]):,}")
+                with c3:
+                    st.caption("Tip: Adjust filters in the sidebar to focus by SUBCAT, COUNTRY, etc.")
+
+            # Small, scrollable summary table
+            with card():
+                st.write("**Summary (user → asset count)**")
+                st.dataframe(
+                    view_summary.reset_index(drop=True),
+                    use_container_width=True,
+                    height=220
+                )
 
             # Pre-sort once for reuse
             df_sorted = filtered.sort_values([user_col, asset_id_col], na_position="last")
 
-            # -------- Details by user (ONLY ≥2 assets) --------
+            # Preferred compact columns for the email table
+            cols_to_show_default = [c for c in PREFERRED_DISPLAY_COLUMNS if c in df_sorted.columns] or list(df_sorted.columns)
+            base_cols_for_email = [asset_id_col, serial_id_col, "MAKE", "MODEL", "SUBCAT", "STATUS", "CITY", "COUNTRY", "LOCNAME"]
+            base_cols_for_email = [c for c in base_cols_for_email if c and c in df_sorted.columns]
+
             st.markdown("#### Details by user (≥2 assets)")
-            email_table_pref_cols = [
-                asset_id_col, serial_id_col, "MAKE", "MODEL", "SUBCAT", "STATUS", "CITY", "COUNTRY", "LOCNAME"
-            ]
-            email_table_pref_cols = [c for c in email_table_pref_cols if c]  # drop None
+            st.caption("Each user has two tabs: **Assets** (full table) and **Email** (ready to copy / download .EML).")
 
             for i, (_, row) in enumerate(view_summary.iterrows()):
                 u = row[user_col]
                 label = u if pd.notna(u) else "(missing user)"
                 user_assets = df_sorted[df_sorted[user_col] == u]
 
-                with st.expander(f"{label} — {len(user_assets)} asset(s)"):
-                    # Show preferred columns if available
-                    cols_to_show = [c for c in PREFERRED_DISPLAY_COLUMNS if c in user_assets.columns] or list(user_assets.columns)
-                    st.dataframe(user_assets[cols_to_show], use_container_width=True, height=300)
+                with st.expander(f"{label} — {len(user_assets)} asset(s)", expanded=False):
+                    tabs_user = st.tabs(["Assets", "Email"])
 
-                    # -------- Email generation UI (per user, copy-ready for Outlook) --------
-                    st.markdown("**✉️ Generate ready-to-send email**")
+                    # --- Tab: Assets (clean table)
+                    with tabs_user[0]:
+                        with card():
+                            cols_to_show = [c for c in PREFERRED_DISPLAY_COLUMNS if c in user_assets.columns] or list(user_assets.columns)
+                            st.dataframe(user_assets[cols_to_show], use_container_width=True, height=280)
 
-                    # Recipient (from email column if present)
-                    recipient = None
-                    if email_col and (email_col in user_assets.columns):
-                        recipient = _first_non_null(user_assets[email_col])
+                    # --- Tab: Email (copy-ready + .EML download)
+                    with tabs_user[1]:
+                        with card():
+                            col_toggle = st.toggle(
+                                "Show extended columns (email table)", value=False, key=f"toggle_cols_{i}"
+                            )
+                            email_cols = (cols_to_show if col_toggle else base_cols_for_email) or cols_to_show_default
 
-                    # Subject + Body defaults (editable)
-                    default_subject = "Asset review — items assigned to you"
-                    default_greeting = f"Hi {label},"
-                    body_table = make_assets_text_table(user_assets, email_table_pref_cols or cols_to_show)
-                    default_body = (
-                        f"{default_greeting}\n\n"
-                        "Please return any assets that you are not using from the following assets under your name:\n\n"
-                        f"{body_table}\n\n"
-                        "If any device is in active use, no action is needed.\n"
-                        "Otherwise, please return unused items to IT. Thank you!\n\n"
-                        "— IT Asset Management"
-                    )
+                            # Recipient (from email column if present)
+                            recipient = None
+                            if email_col and (email_col in user_assets.columns):
+                                recipient = _first_non_null(user_assets[email_col])
 
-                    subject_val = st.text_input(
-                        "Email subject",
-                        value=default_subject,
-                        key=f"subject_group_{i}"
-                    )
-                    body_val = st.text_area(
-                        "Email body (editable; plain text works best in Outlook copy/paste)",
-                        value=default_body,
-                        height=220,
-                        key=f"body_group_{i}"
-                    )
-
-                    # Convenience: mailto link (optional)
-                    mailto_url = build_mailto_link(recipient, subject_val, body_val)
-
-                    cols_email = st.columns([1, 2])
-                    with cols_email[0]:
-                        st.link_button("Open in Mail", mailto_url, use_container_width=True)
-                    with cols_email[1]:
-                        if recipient:
-                            st.caption(f"To: {recipient}")
-                        else:
-                            st.info(
-                                "No email found for this person. Map the Email column in **Column mapping** or enter the address manually after clicking **Open in Mail**."
+                            # Subject + Body defaults (editable)
+                            default_subject = "Asset review — items assigned to you"
+                            default_greeting = f"Hi {label},"
+                            box_table = make_box_table(user_assets, email_cols)
+                            default_body = (
+                                f"{default_greeting}\n\n"
+                                "Please return any assets that you are not using from the following assets under your name:\n\n"
+                                f"{box_table}\n\n"
+                                "If any device is in active use, no action is needed.\n"
+                                "Otherwise, please return unused items to IT. Thank you!\n\n"
+                                "— IT Asset Management"
                             )
 
-                    # Copy-ready preview (includes Subject + Body) — easy to paste into Outlook
-                    preview_text = f"To: {recipient or '<add recipient>'}\nSubject: {subject_val}\n\n{body_val}"
-                    st.markdown("**Copy-ready preview (click the copy icon):**")
-                    st.code(preview_text, language="text")
+                            subject_val = st.text_input(
+                                "Email subject",
+                                value=default_subject,
+                                key=f"subject_group_{i}"
+                            )
+                            body_val = st.text_area(
+                                "Email body (plain text; box table copies cleanly into Outlook)",
+                                value=default_body,
+                                height=220,
+                                key=f"body_group_{i}"
+                            )
 
-            # Set result to a flat table so export works for this scope (only multi-asset users)
+                            # Convenience: mailto link (plain text-only, length-limited)
+                            mailto_url = build_mailto_link(recipient, subject_val, body_val)
+
+                            # Build HTML email (.eml) for Outlook
+                            html_table = make_html_table(user_assets, email_cols)
+                            html_body = f"""
+                            <p>Hi {_html.escape(str(label))},</p>
+                            <p>Please return any assets that you are not using from the following assets under your name:</p>
+                            {html_table}
+                            <p>If any device is in active use, no action is needed.<br>
+                            Otherwise, please return unused items to IT. Thank you!</p>
+                            <p>— IT Asset Management</p>
+                            """
+                            # Use the plain preview as the text fallback
+                            preview_text = f"To: {recipient or '<add recipient>'}\nSubject: {subject_val}\n\n{body_val}"
+                            eml_bytes = build_eml(recipient, subject_val, html_body, text_fallback=preview_text)
+
+                            # Action buttons
+                            st.markdown('<div class="action-bar">', unsafe_allow_html=True)
+                            st.download_button(
+                                "⬇️ Download email (.eml) — open in Outlook to edit & send",
+                                data=eml_bytes,
+                                file_name=f"assets_{(str(label) or 'user').replace(' ','_')}.eml",
+                                mime="message/rfc822",
+                            )
+                            st.link_button("Open in Mail (quick draft)", mailto_url)
+                            st.markdown('</div>', unsafe_allow_html=True)
+
+                            # Copy-ready block
+                            st.markdown("**Copy-ready preview (solid table):**")
+                            st.code(preview_text, language="text")
+
+            # Keep result as the flat table of all rows in scope (only multi-asset users)
             result = df_sorted[df_sorted[user_col].isin(view_summary[user_col])]
 
 elif action == "Users with multiple assets":
-    # ---------- HEADER (inside the Table tab) ----------
     with tab_table:
-        st.subheader("All assets for users who own ≥ 2 assets (flat table)")
+        section_header(
+            "Users with multiple assets",
+            "Shows a flat table of all rows for users who own ≥2 unique assets."
+        )
 
-    # ---------- VALIDATION ----------
+    # VALIDATION
     if not user_col or user_col not in filtered.columns:
         with tab_table:
             st.warning("User column not detected. Use the 'Column mapping' override to select EMPNAME/USER/etc.")
@@ -655,24 +831,26 @@ elif action == "Users with multiple assets":
         result = filtered.head(0)
 
     else:
-        # ---------- COMPUTE THE FLAT TABLE (ALL ROWS FOR USERS WITH ≥2 ASSETS) ----------
         counts = (
             filtered.groupby(user_col, dropna=False)[asset_id_col]
             .nunique()
             .reset_index(name="ASSET_COUNT")
         )
         multi_users = counts.loc[counts["ASSET_COUNT"] >= 2, user_col].dropna()
-
         result = filtered[filtered[user_col].isin(multi_users)].copy()
 
-        # Stable, readable ordering
         sort_cols = [c for c in [user_col, asset_id_col] if c in result.columns]
         if sort_cols:
             result = result.sort_values(sort_cols, na_position="last", kind="mergesort").reset_index(drop=True)
 
-        # ---------- SHOW CAPTION + DEDICATED DOWNLOAD BUTTON ----------
         with tab_table:
-            st.caption(f"Users with ≥2 assets: {multi_users.nunique()} • Rows shown: {len(result):,}")
+            with card():
+                c1, c2 = st.columns([1,2])
+                with c1:
+                    st.metric("Users (≥2 assets)", f"{multi_users.nunique():,}")
+                with c2:
+                    st.metric("Rows shown", f"{len(result):,}")
+                st.caption("Use filters in the sidebar to refine by type, geo, status, etc.")
 
             cols_to_export = [c for c in PREFERRED_DISPLAY_COLUMNS if c in result.columns] or list(result.columns)
             try:
@@ -702,7 +880,7 @@ elif action == "Assets aged ≥ N years":
         step=1
     )
     with tab_table:
-        st.subheader(f"Assets aged ≥ {threshold} years")
+        section_header(f"Assets aged ≥ {threshold} years")
     result = filter_age_threshold(filtered, age_col, threshold)
     if result.empty and (not age_col or age_col not in df.columns):
         st.warning("No AGE column detected. Add an AGE column or a purchase date so the app can compute AGE.")
@@ -711,9 +889,10 @@ else:
 
 # ---------- TABLE TAB: display & export ----------
 with tab_table:
+    st.markdown("### Results")
+    st.caption("This table reflects the current action and filters.")
     cols_to_show = [c for c in PREFERRED_DISPLAY_COLUMNS if c in result.columns] or list(result.columns)
 
-    st.markdown("### Results")
     st.write(f"Rows: {len(result):,}")
     st.dataframe(result[cols_to_show], use_container_width=True, height=560)
 
@@ -733,8 +912,7 @@ with tab_table:
 
 # ---------- CHARTS TAB ----------
 with tab_charts:
-    st.subheader("Key Visuals")
-
+    section_header("Key Visuals")
     c1, c2 = st.columns(2)
 
     with c1:
@@ -790,7 +968,7 @@ with tab_charts:
 
 # ---------- SUMMARY TAB ----------
 with tab_summary:
-    st.subheader("Data Quality & Summary")
+    section_header("Data Quality & Summary")
 
     missing_name = int(filtered["EMPNAME"].isna().sum()) if "EMPNAME" in filtered.columns else 0
     missing_id   = int(filtered["EMPID"].isna().sum())   if "EMPID" in filtered.columns else 0
