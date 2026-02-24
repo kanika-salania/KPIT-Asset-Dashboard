@@ -1,5 +1,5 @@
 # KPIT-Asset-Dashboard
-This app is for KPIT's IT team, to use internally for efficiency and organization :)
+This app is used to determine certain values, filter out assets, and predict when an asset should be replaced within a company. Originally used by KPIT's IT team. :)
 
 # IT Streamlit App
 
