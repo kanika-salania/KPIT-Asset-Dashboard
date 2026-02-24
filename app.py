@@ -615,48 +615,127 @@ def train_bootstrap_model(df_feats: pd.DataFrame, cat_cols: list[str], num_cols:
     return best_name, scores[best_name]["model"], scores
 
 # ---------- Sidebar: Source & Load ----------
+# ---------- Sidebar: Source & Load ----------
 st.sidebar.header("📄 Data Source")
 
 uploaded = st.sidebar.file_uploader(
     "Upload an Excel file (.xlsx)",
     type=["xlsx"],
-    help="Pick an Excel file from your computer. If you also type a path below, the uploaded file takes priority."
+    help="Pick an Excel file from your computer. Upload overrides the path."
 )
+
 excel_path = st.sidebar.text_input("Or provide Excel file path", value=DEFAULT_EXCEL_PATH)
 
-def read_excel_sheets(file_like_or_path) -> list[str]:
-    xls = pd.ExcelFile(file_like_or_path, engine="openpyxl")
-    return xls.sheet_names
+import hashlib
+import io
+import os
 
-source = uploaded if uploaded is not None else excel_path
+
+# --------- Read sheets safely ----------
+def get_sheet_names_from_bytes(file_bytes):
+    return pd.ExcelFile(io.BytesIO(file_bytes), engine="openpyxl").sheet_names
+
+
+# --------- Cache-aware loader (fixed) ----------
+@st.cache_data(show_spinner=True)
+def load_data_fixed(file_bytes, sheet):
+    """
+    Fully safe loader:
+    - Always reads from clean BytesIO
+    - Cached by file bytes + sheet
+    """
+    df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet, engine="openpyxl")
+    df = normalize_columns(df)
+
+    # --- your existing detection / cleanup code ---
+    user_col = guess_column(df, USER_CANDIDATES)
+    age_col = guess_column(df, AGE_CANDIDATES)
+    purchase_col = guess_column(df, PURCHASE_DATE_CANDIDATES)
+    asset_id_col = guess_column(df, ASSET_ID_CANDIDATES)
+    serial_id_col = guess_column(df, SERIAL_ID_CANDIDATES)
+    email_col = guess_column(df, EMAIL_CANDIDATES)
+
+    if user_col is None:
+        if "EMPNAME" in df.columns:
+            user_col = "EMPNAME"
+        elif "EMPID" in df.columns:
+            user_col = "EMPID"
+
+    if age_col is None and purchase_col is not None:
+        df = compute_age_from_purchase_date(df, purchase_col, out_col="AGE")
+        age_col = "AGE"
+
+    if age_col and age_col in df.columns:
+        df[age_col] = to_numeric_safe(df[age_col])
+
+    text_cols_to_clean = [
+        "MAKE","MODEL","CITY","COUNTRY","SUBLOC","LEVEL",
+        "LOCNAME","SEATNO","STATUS","USER","ASSIGNEE","ASSIGNED_TO",
+        "OWNER","CAT","EMPNAME","EMPID","SUBCAT","ITEMTYPE"
+    ]
+    if email_col and email_col in df.columns:
+        text_cols_to_clean.append(email_col)
+
+    df = normalize_text_columns(df, [c for c in text_cols_to_clean if c in df.columns])
+
+    cat_cols = ["MAKE","MODEL","SUBCAT","ITEMTYPE","CITY","COUNTRY","STATUS","LOCNAME","SUBLOC","LEVEL","CAT"]
+    df = standardize_value_case(df, [c for c in cat_cols if c in df.columns])
+
+    return {
+        "df": df,
+        "user_col": user_col,
+        "age_col": age_col,
+        "purchase_col": purchase_col,
+        "asset_id_col": asset_id_col,
+        "serial_id_col": serial_id_col,
+        "email_col": email_col,
+    }
+
+
+# ---------- Determine source & load sheet names ----------
+file_bytes = None
 sheet_names = []
-try:
-    if source:
-        sheet_names = read_excel_sheets(source)
-except Exception as e:
-    st.sidebar.warning(f"Could not read sheet names: {e}")
 
-if sheet_names:
-    sheet = st.sidebar.selectbox("Sheet", options=sheet_names, index=0)
+if uploaded is not None:
+    file_bytes = uploaded.getvalue()
+    try:
+        sheet_names = get_sheet_names_from_bytes(file_bytes)
+    except Exception as e:
+        st.sidebar.error(f"Failed reading uploaded file: {e}")
 else:
-    sheet_in = st.sidebar.text_input("Sheet name or index", value=str(DEFAULT_SHEET_NAME))
-    sheet = int(sheet_in) if sheet_in.isdigit() else sheet_in
-
-try:
-    if uploaded is not None:
-        data = load_data(uploaded, sheet)
+    if os.path.exists(excel_path):
+        try:
+            with open(excel_path, "rb") as f:
+                file_bytes = f.read()
+            sheet_names = get_sheet_names_from_bytes(file_bytes)
+        except Exception as e:
+            st.sidebar.error(f"Failed reading file path: {e}")
     else:
-        data = load_data(excel_path, sheet)
+        st.sidebar.warning("Provide a valid file path or upload a file.")
 
-    df = data["df"]
-    user_col = data["user_col"]
-    age_col = data["age_col"]
-    purchase_col = data["purchase_col"]
-    asset_id_col = data["asset_id_col"]
-    serial_id_col = data["serial_id_col"]
-    email_col = data["email_col"]
-except Exception as e:
-    st.sidebar.error(f"Failed to load Excel: {e}")
+# Sheet selection
+if sheet_names:
+    sheet = st.sidebar.selectbox("Sheet", sheet_names, index=0)
+else:
+    sheet = st.sidebar.text_input("Sheet (name/index)", "Sheet1")
+
+
+# ---------- Final load ----------
+if file_bytes is not None:
+    try:
+        data = load_data_fixed(file_bytes, sheet)
+        df = data["df"]
+        user_col = data["user_col"]
+        age_col = data["age_col"]
+        purchase_col = data["purchase_col"]
+        asset_id_col = data["asset_id_col"]
+        serial_id_col = data["serial_id_col"]
+        email_col = data["email_col"]
+        st.sidebar.success(f"Loaded {len(df):,} rows")
+    except Exception as e:
+        st.sidebar.error(f"Data load error: {e}")
+        st.stop()
+else:
     st.stop()
 
 st.sidebar.success(f"Loaded {len(df):,} rows")
@@ -1195,3 +1274,4 @@ with tab_ml:
             ] if c in combined.columns] or list(combined.columns)
             st.dataframe(combined.sort_values(["IMMEDIATE_REPLACE","_ML_PROB"], ascending=[False,False])[cols_to_show],
                          use_container_width=True, height=300)
+
