@@ -635,7 +635,7 @@ uploaded = st.sidebar.file_uploader(
     on_change=_on_upload_change,
 )
 
-excel_path = st.sidebar.text_input("Or provide Excel file path", value=DEFAULT_EXCEL_PATH)
+excel_path = st.sidebar.text_input("Or provide Excel file path")
 
 # ---- Helpers that ONLY work from bytes ----
 def read_excel_sheets_from_bytes(file_bytes) -> list[str]:
@@ -1291,3 +1291,4 @@ with tab_ml:
             ] if c in combined.columns] or list(combined.columns)
             st.dataframe(combined.sort_values(["IMMEDIATE_REPLACE","_ML_PROB"], ascending=[False,False])[cols_to_show],
                          use_container_width=True, height=300)
+
