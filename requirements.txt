@@ -4,5 +4,6 @@ streamlit>=1.54.0,<2.0     # latest stable supports Python 3.13
 numpy>=2.1                  # NumPy 2.1+ supports Python 3.10–3.13
 pandas>=2.2.3               # Verified to work on 3.13; or use pandas>=2.3
 altair>=6.0.0               # 6.0+ released Nov 2025; earlier 5.x had 3.13 issues
+openpyxl
 scikit-learn
 
